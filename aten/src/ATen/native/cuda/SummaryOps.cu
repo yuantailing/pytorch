@@ -316,7 +316,7 @@ Tensor _histc_cuda_template(
   }
   Tensor output = at::zeros(
       {nbins},
-      self.scalar_type(),
+      kLong,
       c10::nullopt /* layout */,
       DeviceType::CUDA,
       c10::nullopt /* pin_memory */);
@@ -352,7 +352,7 @@ Tensor _histc_cuda_template(
 #endif
   TORCH_CHECK(minvalue < maxvalue, "max must be larger than min");
 
-  cuda::CUDA_tensor_histogram<input_t, input_t, false>(
+  cuda::CUDA_tensor_histogram<int64_t, input_t, false>(
       output, self, Tensor(), nbins, minvalue, maxvalue);
   return output;
 }

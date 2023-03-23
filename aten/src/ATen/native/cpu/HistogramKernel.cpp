@@ -1,4 +1,5 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <ATen/AccumulateType.h>
 #include <ATen/native/Histogram.h>
 
 #include <ATen/core/Tensor.h>
@@ -129,13 +130,14 @@ void histogramdd_cpu_contiguous(Tensor& hist, const TensorList& bin_edges,
     thread_hist_sizes[0] = num_threads;
     std::copy(hist_sizes.begin(), hist_sizes.end(),
               thread_hist_sizes.begin() + 1);
-    Tensor thread_histograms = at::zeros(thread_hist_sizes, hist.dtype());
+    using accum_t = typename at::AccumulateType<input_t, /*is_cuda=*/false>::type;
+    Tensor thread_histograms = at::zeros(thread_hist_sizes, c10::CppTypeToScalarType<accum_t>::value);
     TORCH_INTERNAL_ASSERT(thread_histograms.is_contiguous());
 
     at::parallel_for(0, N, GRAIN_SIZE, [&](int64_t start, int64_t end) {
         const auto tid = at::get_thread_num();
         auto hist_strides = thread_histograms.strides();
-        input_t *hist_local_data = thread_histograms.data_ptr<input_t>();
+        accum_t *hist_local_data = thread_histograms.data_ptr<accum_t>();
 
         // View only this thread's local results
         hist_local_data += hist_strides[0] * tid;
