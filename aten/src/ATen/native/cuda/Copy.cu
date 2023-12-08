@@ -130,6 +130,25 @@ void neg_conj_kernel_cuda(TensorIteratorBase &iter) {
 
 using namespace at::cuda;
 
+static bool is_2d_layout(const TensorIterator& iter) {
+  if (iter.ndim() == 2 && iter.has_contiguous_first_dim()) {
+    int64_t bytes_per_line = iter.shape()[0] * iter.element_size(0);
+    int64_t dst_stride = iter.strides(0)[1];
+    int64_t src_stride = iter.strides(1)[1];
+    if (bytes_per_line <= dst_stride && bytes_per_line <= src_stride)
+      return true;
+  }
+  return false;
+}
+
+static bool same_device_or_support_uvm(const TensorIterator& iter) {
+  Device dst_device = iter.device(0);
+  Device src_device = iter.device(1);
+  return dst_device == src_device ||
+         (getDeviceProperties(dst_device.index())->unifiedAddressing &&
+          getDeviceProperties(src_device.index())->unifiedAddressing);
+}
+
 // device-to-device copy, does type conversion
 void copy_device_to_device(TensorIterator& iter,
                            bool non_blocking,
@@ -142,6 +161,8 @@ void copy_device_to_device(TensorIterator& iter,
   bool same_conj = iter.tensor(0).is_conj() == iter.tensor(1).is_conj();
   bool same_neg = iter.tensor(0).is_neg() == iter.tensor(1).is_neg();
   bool memcpy_eligible = same_type && same_conj && same_neg && iter.is_contiguous();
+  bool memcpy_2d_eligible = same_type && same_conj && same_neg && is_2d_layout(iter) &&
+                            same_device_or_support_uvm(iter);
 
   Device dst_device = iter.device(0);
   Device src_device = iter.device(1);
@@ -184,6 +205,16 @@ void copy_device_to_device(TensorIterator& iter,
         src, src_device.index(),
         size, copy_stream, p2p_enabled));
     }
+  } else if (memcpy_2d_eligible) {
+    void *dst = iter.data_ptr(0);
+    void *src = iter.data_ptr(1);
+    size_t dpitch = iter.strides(0)[1];
+    size_t spitch = iter.strides(1)[1];
+    size_t width = iter.shape()[0] * iter.element_size(0);
+    size_t height = iter.shape()[1];
+    AT_CUDA_CHECK(cudaMemcpy2DAsync(
+      dst, dpitch, src, spitch, width, height,
+      cudaMemcpyDeviceToDevice, copy_stream));
   } else {
     if (same_neg) {
       if (!same_conj) {
@@ -229,6 +260,14 @@ static bool copy_requires_temporaries(TensorIterator& iter, bool p2p_enabled) {
   if (same_dtype && iter.is_contiguous()) {
     // Contiguous same-dtype copies can always use cudaMemcpyAsync
     return false;
+  } else if (same_dtype && is_2d_layout(iter)) {
+    if (dst_device.is_cuda() && src_device.is_cuda()) {
+      // 2D same-type copies between GPUs can use cudaMemcpy2DAsync if UVM is supported
+      return same_device_or_support_uvm(iter);
+    } else {
+      // 2D same-dtype copies between CPU and GPU can always use cudaMemcpy2DAsync
+      return false;
+    }
   } else if (dst_device.is_cuda() && src_device.is_cuda()) {
     // Copies between GPUs can use the copy kernel if P2P is supported
     return !p2p_enabled;
@@ -319,7 +358,15 @@ static void copy_kernel_cuda(TensorIterator& iter, bool non_blocking) {
   CUDAStream stream = getCurrentCUDAStream();
 
   if (non_blocking) {
-    AT_CUDA_CHECK(cudaMemcpyAsync(dst, src, nbytes, kind, stream));
+    if (iter.is_contiguous()) {
+      AT_CUDA_CHECK(cudaMemcpyAsync(dst, src, nbytes, kind, stream));
+    } else {
+      size_t dpitch = iter.strides(0)[1];
+      size_t spitch = iter.strides(1)[1];
+      size_t width = iter.shape()[0] * iter.element_size(0);
+      size_t height = iter.shape()[1];
+      AT_CUDA_CHECK(cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, kind, stream));
+    }
     // we use both the storage context and the tensor data pointer as the key
     // for the caching host allocator. This allows us to better attribute the
     // events to the original tensor allocation correctly. The cases we seek to
@@ -340,7 +387,15 @@ static void copy_kernel_cuda(TensorIterator& iter, bool non_blocking) {
     CachingHostAllocator_recordEvent(ptr, ctx, stream);
 
   } else {
-    at::cuda::memcpy_and_sync(dst, src, nbytes, kind, stream);
+    if (iter.is_contiguous()) {
+      at::cuda::memcpy_and_sync(dst, src, nbytes, kind, stream);
+    } else {
+      size_t dpitch = iter.strides(0)[1];
+      size_t spitch = iter.strides(1)[1];
+      size_t width = iter.shape()[0] * iter.element_size(0);
+      size_t height = iter.shape()[1];
+      at::cuda::memcpy_2d_and_sync(dst, dpitch, src, spitch, width, height, kind, stream);
+    }
   }
 
   if (iter.tensor(0).is_conj() != iter.tensor(1).is_conj()) {
